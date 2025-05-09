@@ -248,7 +248,6 @@ def main():
             listen="0.0.0.0",
             port=WEBHOOK_PORT,
             webhook_url=webhook_url,
-            webhook_path=WEBHOOK_PATH,
             drop_pending_updates=True
         )
     else:
