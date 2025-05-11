@@ -93,9 +93,10 @@ async def split_audio(audio_path, max_duration_ms=60000):
         if len(audio) <= max_duration_ms:
             return [audio_path]
         chunks = []
-        for i, chunk in enumerate(audio[::max_duration_ms]):
-            chunk_path = os.path.join(TEMP_DIR, f"chunk_{i}_{uuid.uuid4()}.pcm")
-            chunk.export(chunk_path, format="raw", codec="pcm_s16le", parameters=["-ar", "16000", "-ac", "1", "-f", "s16le"])
+        for i, start in enumerate(range(0, len(audio), max_duration_ms)):
+            chunk = audio[start:start+max_duration_ms]
+            chunk_path = os.path.join(TEMP_DIR, f"chunk_{i}_{uuid.uuid4()}.wav")
+            chunk.export(chunk_path, format="wav")
             chunks.append(chunk_path)
         return chunks
     except Exception as e:
@@ -131,18 +132,19 @@ def transcribe_audio_chunk(audio_path):
         raise
 
 async def transcribe_audio(audio_path):
-    prepared_audio = await prepare_audio(audio_path)
-    chunks = await split_audio(prepared_audio)
+    # 1. Сначала делим исходный файл на куски (wav)
+    chunks = await split_audio(audio_path)
     transcripts = []
     for chunk_path in chunks:
         try:
-            transcript = transcribe_audio_chunk(chunk_path)
+            # 2. Каждый кусок конвертируем в .pcm
+            prepared_audio = await prepare_audio(chunk_path)
+            transcript = transcribe_audio_chunk(prepared_audio)
             transcripts.append(transcript)
             os.remove(chunk_path)
+            os.remove(prepared_audio)
         except Exception as e:
             logger.error(f"Ошибка при распознавании фрагмента {chunk_path}: {e}")
-    if prepared_audio != audio_path:
-        os.remove(prepared_audio)
     full_transcript = " ".join(transcripts)
     return full_transcript
 
@@ -248,6 +250,7 @@ def main():
             listen="0.0.0.0",
             port=WEBHOOK_PORT,
             webhook_url=webhook_url,
+            url_path=WEBHOOK_PATH,
             drop_pending_updates=True
         )
     else:
