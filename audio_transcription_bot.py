@@ -89,7 +89,17 @@ async def prepare_audio(audio_path):
 
 async def split_audio(audio_path, max_duration_ms=60000):
     try:
-        audio = AudioSegment.from_file(audio_path)
+        # Предварительная проверка аудиофайла
+        try:
+            audio = AudioSegment.from_file(audio_path)
+            # Проверка атрибутов для выявления проблем до разделения
+            _ = audio.sample_width
+            _ = audio.frame_rate
+            _ = audio.channels
+        except Exception as e:
+            logger.error(f"Ошибка при открытии аудиофайла {audio_path}: {e}")
+            raise ValueError(f"Невозможно открыть аудиофайл: {e}")
+            
         if len(audio) <= max_duration_ms:
             return [audio_path]
         chunks = []
@@ -135,7 +145,10 @@ async def transcribe_audio(audio_path):
     # 1. Сначала делим исходный файл на куски (wav)
     chunks = await split_audio(audio_path)
     transcripts = []
-    for chunk_path in chunks:
+    failed_chunks = []
+    
+    # Первый проход по всем фрагментам
+    for i, chunk_path in enumerate(chunks):
         try:
             # 2. Каждый кусок конвертируем в .pcm
             prepared_audio = await prepare_audio(chunk_path)
@@ -144,9 +157,41 @@ async def transcribe_audio(audio_path):
             os.remove(chunk_path)
             os.remove(prepared_audio)
         except Exception as e:
-            logger.error(f"Ошибка при распознавании фрагмента {chunk_path}: {e}")
-    full_transcript = " ".join(transcripts)
-    return full_transcript
+            logger.error(f"Ошибка при распознавании фрагмента {i+1}/{len(chunks)} {chunk_path}: {e}")
+            failed_chunks.append((i, chunk_path))
+    
+    # Повторная попытка для неудачных фрагментов
+    retry_errors = []
+    for i, chunk_path in failed_chunks:
+        try:
+            logger.info(f"Повторная попытка распознавания фрагмента {i+1}/{len(chunks)}")
+            prepared_audio = await prepare_audio(chunk_path)
+            transcript = transcribe_audio_chunk(prepared_audio)
+            # Вставляем в нужную позицию
+            while len(transcripts) <= i:
+                transcripts.append("")
+            transcripts[i] = transcript
+            os.remove(chunk_path)
+            os.remove(prepared_audio)
+        except Exception as e:
+            error_msg = f"Не удалось распознать фрагмент {i+1}/{len(chunks)} даже после повторной попытки: {e}"
+            logger.error(error_msg)
+            retry_errors.append(error_msg)
+            # Удаляем файлы
+            try:
+                os.remove(chunk_path)
+                if os.path.exists(prepared_audio):
+                    os.remove(prepared_audio)
+            except:
+                pass
+    
+    full_transcript = " ".join(filter(None, transcripts))
+    
+    # Если были ошибки после повторных попыток, добавляем информацию
+    if retry_errors:
+        full_transcript += "\n\n[Внимание: Некоторые части аудио не удалось распознать]"
+    
+    return full_transcript, retry_errors if retry_errors else None
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -179,7 +224,7 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
     await file.download_to_drive(file_path)
     await message.edit_text("Файл получен. Начинаю распознавание...")
     try:
-        transcript = await transcribe_audio(file_path)
+        transcript, retry_errors = await transcribe_audio(file_path)
         os.remove(file_path)
         # Отправляем результат
         if transcript:
@@ -195,6 +240,22 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
                     caption="Текст распознавания слишком длинный, отправляю как файл."
                 )
                 os.remove(transcript_file)
+            
+            # Если были ошибки, отправляем дополнительное сообщение
+            if retry_errors:
+                error_msg = "При распознавании возникли следующие проблемы:\n" + "\n".join(retry_errors)
+                if len(error_msg) <= 4000:
+                    await update.message.reply_text(error_msg)
+                else:
+                    error_file = os.path.join(TEMP_DIR, f"errors_{uuid.uuid4()}.txt")
+                    with open(error_file, "w", encoding="utf-8") as f:
+                        f.write(error_msg)
+                    await update.message.reply_document(
+                        document=open(error_file, "rb"),
+                        filename="errors.txt",
+                        caption="Подробная информация об ошибках при распознавании."
+                    )
+                    os.remove(error_file)
         else:
             await update.message.reply_text("Не удалось распознать речь в аудиофайле.")
         clear_temp_dir()
@@ -215,7 +276,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await file.download_to_drive(file_path)
     await message.edit_text("Файл получен. Начинаю распознавание...")
     try:
-        transcript = await transcribe_audio(file_path)
+        transcript, retry_errors = await transcribe_audio(file_path)
         os.remove(file_path)
         if transcript:
             if len(transcript) <= 4000:
@@ -230,6 +291,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption="Текст распознавания слишком длинный, отправляю как файл."
                 )
                 os.remove(transcript_file)
+            
+            # Если были ошибки, отправляем дополнительное сообщение
+            if retry_errors:
+                error_msg = "При распознавании возникли следующие проблемы:\n" + "\n".join(retry_errors)
+                if len(error_msg) <= 4000:
+                    await update.message.reply_text(error_msg)
+                else:
+                    error_file = os.path.join(TEMP_DIR, f"errors_{uuid.uuid4()}.txt")
+                    with open(error_file, "w", encoding="utf-8") as f:
+                        f.write(error_msg)
+                    await update.message.reply_document(
+                        document=open(error_file, "rb"),
+                        filename="errors.txt",
+                        caption="Подробная информация об ошибках при распознавании."
+                    )
+                    os.remove(error_file)
         else:
             await update.message.reply_text("Не удалось распознать речь в аудиофайле.")
         clear_temp_dir()
