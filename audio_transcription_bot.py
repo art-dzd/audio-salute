@@ -13,7 +13,6 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 import urllib3
 import shutil
-import re
 
 # Отключаем предупреждения SSL для тестирования
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -213,37 +212,17 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
     message = await update.message.reply_text("Получил аудио. Начинаю обработку...")
     try:
         if update.message.voice:
-            file_id = update.message.voice.file_id
+            file = await context.bot.get_file(update.message.voice.file_id)
             file_ext = "ogg"
         elif update.message.audio:
-            file_id = update.message.audio.file_id
+            file = await context.bot.get_file(update.message.audio.file_id)
             file_ext = os.path.splitext(update.message.audio.file_name)[1] if update.message.audio.file_name else "mp3"
             file_ext = file_ext.lstrip(".")
         else:
             await message.edit_text("Ошибка: не могу определить тип аудиофайла.")
             return
-        
         file_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}.{file_ext}")
-        
-        try:
-            # Сначала пробуем стандартный метод
-            file = await context.bot.get_file(file_id)
-            await file.download_to_drive(file_path)
-        except Exception as e:
-            error_message = str(e)
-            logger.warning(f"Не удалось загрузить файл стандартным методом: {error_message}")
-            
-            if "file is too big" in error_message.lower():
-                await message.edit_text("Файл слишком большой для стандартного API. Пробую альтернативный метод загрузки...")
-                # Пробуем альтернативный метод для больших файлов
-                success = await download_large_telegram_file(file_id, file_path)
-                if not success:
-                    await message.edit_text("Не удалось загрузить файл. Файл слишком большой (более 20 МБ). Пожалуйста, отправьте файл меньшего размера или разбейте аудио на части.")
-                    return
-            else:
-                await message.edit_text(f"Произошла ошибка при получении файла: {error_message}")
-                return
-        
+        await file.download_to_drive(file_path)
         await message.edit_text("Файл получен. Начинаю распознавание...")
         try:
             transcript, retry_errors = await transcribe_audio(file_path)
@@ -288,7 +267,10 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         error_message = str(e)
         logger.error(f"Ошибка при получении файла: {error_message}")
-        await message.edit_text(f"Произошла неизвестная ошибка: {error_message}")
+        if "File is too big" in error_message:
+            await message.edit_text("Ошибка: аудиофайл слишком большой. Telegram ограничивает размер файлов до 20 МБ. Пожалуйста, отправьте файл меньшего размера или разбейте аудио на части.")
+        else:
+            await message.edit_text(f"Произошла ошибка при получении файла: {error_message}")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.document.file_name or not is_audio_file(update.message.document.file_name):
@@ -296,30 +278,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     message = await update.message.reply_text("Получил аудиофайл. Начинаю обработку...")
     try:
-        file_id = update.message.document.file_id
+        file = await context.bot.get_file(update.message.document.file_id)
         file_ext = os.path.splitext(update.message.document.file_name)[1]
         file_ext = file_ext.lstrip(".")
         file_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}.{file_ext}")
-        
-        try:
-            # Сначала пробуем стандартный метод
-            file = await context.bot.get_file(file_id)
-            await file.download_to_drive(file_path)
-        except Exception as e:
-            error_message = str(e)
-            logger.warning(f"Не удалось загрузить файл стандартным методом: {error_message}")
-            
-            if "file is too big" in error_message.lower():
-                await message.edit_text("Файл слишком большой для стандартного API. Пробую альтернативный метод загрузки...")
-                # Пробуем альтернативный метод для больших файлов
-                success = await download_large_telegram_file(file_id, file_path)
-                if not success:
-                    await message.edit_text("Не удалось загрузить файл. Файл слишком большой (более 20 МБ). Пожалуйста, отправьте файл меньшего размера или разбейте аудио на части.")
-                    return
-            else:
-                await message.edit_text(f"Произошла ошибка при получении файла: {error_message}")
-                return
-        
+        await file.download_to_drive(file_path)
         await message.edit_text("Файл получен. Начинаю распознавание...")
         try:
             transcript, retry_errors = await transcribe_audio(file_path)
@@ -363,53 +326,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         error_message = str(e)
         logger.error(f"Ошибка при получении файла: {error_message}")
-        await message.edit_text(f"Произошла неизвестная ошибка: {error_message}")
-
-async def download_large_telegram_file(file_id, custom_path):
-    """Функция для скачивания больших файлов через прямые URL Telegram"""
-    bot_token = TELEGRAM_TOKEN
-    file_info_url = f"https://api.telegram.org/bot{bot_token}/getFile?file_id={file_id}"
-    
-    try:
-        response = requests.get(file_info_url)
-        response.raise_for_status()
-        result = response.json()
-        
-        if not result.get("ok"):
-            error_message = result.get("description", "Неизвестная ошибка")
-            if "file is too big" in error_message.lower():
-                # Если файл больше 20MB, пробуем другой способ
-                try:
-                    # Получаем путь напрямую через старый формат URL, который работает для файлов до 2GB
-                    # Это не официальный метод, но работает для многих версий Telegram API
-                    url = f"https://api.telegram.org/file/bot{bot_token}/old_method/{file_id}"
-                    logger.info(f"Пробую скачать большой файл напрямую через URL: {url}")
-                    response = requests.get(url, stream=True)
-                    response.raise_for_status()
-                    
-                    with open(custom_path, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                    return True
-                except Exception as e:
-                    logger.error(f"Ошибка при скачивании большого файла альтернативным методом: {e}")
-                    return False
-            else:
-                raise Exception(error_message)
-        
-        file_path = result["result"]["file_path"]
-        download_url = f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
-        
-        response = requests.get(download_url, stream=True)
-        response.raise_for_status()
-        
-        with open(custom_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка при скачивании файла: {e}")
-        return False
+        if "File is too big" in error_message:
+            await message.edit_text("Ошибка: аудиофайл слишком большой. Telegram ограничивает размер файлов до 20 МБ. Пожалуйста, отправьте файл меньшего размера или разбейте аудио на части.")
+        else:
+            await message.edit_text(f"Произошла ошибка при получении файла: {error_message}")
 
 def main():
     application = Application.builder().token(TELEGRAM_TOKEN).build()
